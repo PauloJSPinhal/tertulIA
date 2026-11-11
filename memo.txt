@@ -1,0 +1,9 @@
+# 1. Criar o projeto Vite com React
+pm create vite@latest tertulia -- --template react
+
+# 2. Entrar na pasta e instalar dependências
+cd tertulia
+npm install lucide-react
+
+# 3. Instalar e configurar Tailwind CSS (v4 ou v3)
+npm install -D tailwindcss @tailwindcss/vite

@@ -1,0 +1,38 @@
+export const THEMES = {
+  slate: {
+    id: 'slate',
+    name: 'Nocturno (Slate)',
+    bg: 'bg-slate-950',
+    panelBg: 'bg-slate-900',
+    border: 'border-slate-800',
+    textMain: 'text-slate-100',
+    textMuted: 'text-slate-400',
+    inputBg: 'bg-slate-900/80',
+    userBubble: 'bg-emerald-600 text-white',
+    aiBubbleBg: 'bg-slate-900/95',
+  },
+  sepia: {
+    id: 'sepia',
+    name: 'Café Literário (Sépia)',
+    bg: 'bg-[#1c1917]',
+    panelBg: 'bg-[#292524]',
+    border: 'border-[#44403c]',
+    textMain: 'text-[#f5f5f4]',
+    textMuted: 'text-[#a8a29e]',
+    inputBg: 'bg-[#292524]',
+    userBubble: 'bg-[#d97706] text-white',
+    aiBubbleBg: 'bg-[#292524]',
+  },
+  oled: {
+    id: 'oled',
+    name: 'OLED Puro (Midnight)',
+    bg: 'bg-black',
+    panelBg: 'bg-zinc-950',
+    border: 'border-zinc-800',
+    textMain: 'text-zinc-100',
+    textMuted: 'text-zinc-500',
+    inputBg: 'bg-zinc-900',
+    userBubble: 'bg-sky-600 text-white',
+    aiBubbleBg: 'bg-zinc-950',
+  }
+};

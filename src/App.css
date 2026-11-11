@@ -1,0 +1,734 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Bot, Send, Settings, MessageSquare, Plus, Trash2, 
+  Eye, EyeOff, Users, Square, Image as ImageIcon, X, 
+  Download, Play, CheckCircle2, ChevronRight, RefreshCw
+} from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+
+import { OPERATORS, PERSONALITY_TRAITS, PRESET_COLORS } from './constants/operators';
+import { THEMES } from './constants/themes';
+import { processAndCompressImage } from './services/imageUtils';
+import { sendAgentMessage } from './services/llmAdapters';
+import { exportConversationToMarkdown } from './services/exportUtils';
+
+export default function App() {
+  // --- Estados de Configuração e Navegação ---
+  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'agents' | 'settings'
+  const [themeId, setThemeId] = useState(() => localStorage.getItem('tertulia_theme') || 'slate');
+  const theme = THEMES[themeId] || THEMES.slate;
+
+  // --- Tertulianos Configurados ---
+  const [agents, setAgents] = useState(() => {
+    const saved = localStorage.getItem('tertulia_agents_v2');
+    return saved ? JSON.parse(saved) : [
+      {
+        id: 'gemini-base',
+        displayName: 'Gemini',
+        operator: 'google',
+        model: 'gemini-3.5-flash-lite',
+        apiKey: '',
+        color: '#0284c7',
+        traits: { tones: ['informal'], stances: ['constructive'], styles: ['concise'] },
+        customInstruction: '',
+        builtInstruction: 'Responde de forma concisa e descontraída.'
+      }
+    ];
+  });
+
+  // --- Sessões / Conversas Guardadas ---
+  const [sessions, setSessions] = useState(() => {
+    const saved = localStorage.getItem('tertulia_sessions');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [sessionTitle, setSessionTitle] = useState('Tertúlia Aberta');
+
+  // --- Estado do Diálogo Atual ---
+  const [messages, setMessages] = useState([]);
+  const [inputMessage, setInputMessage] = useState('');
+  const [attachedImage, setAttachedImage] = useState(null); // { dataUrl, base64Data, mimeType }
+  const [selectedAgentIds, setSelectedAgentIds] = useState([]); // Quem está sentado à mesa nesta sessão
+
+  // --- Dinâmica de Réplicas Entre IAs ---
+  const [turnTakingMode, setTurnTakingMode] = useState('sequential'); // 'sequential' | 'mention' | 'none'
+  const [maxReplicas, setMaxReplicas] = useState(3);
+  const [isDialogueRunning, setIsDialogueRunning] = useState(false);
+  const [currentReplicaCount, setCurrentReplicaCount] = useState(0);
+  const [loadingAgentName, setLoadingAgentName] = useState(null);
+  
+  const stopRequestedRef = useRef(false);
+  const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  // Inicializar quem está à mesa
+  useEffect(() => {
+    if (selectedAgentIds.length === 0 && agents.length > 0) {
+      setSelectedAgentIds(agents.map(a => a.id));
+    }
+  }, [agents]);
+
+  // Persistência
+  useEffect(() => {
+    localStorage.setItem('tertulia_agents_v2', JSON.stringify(agents));
+  }, [agents]);
+
+  useEffect(() => {
+    localStorage.setItem('tertulia_sessions', JSON.stringify(sessions));
+  }, [sessions]);
+
+  useEffect(() => {
+    localStorage.setItem('tertulia_theme', themeId);
+  }, [themeId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, loadingAgentName]);
+
+  // Montar instruções de personalidade
+  const updateAgentTraits = (agentId, category, traitId) => {
+    setAgents(prev => prev.map(a => {
+      if (a.id !== agentId) return a;
+      const currentList = a.traits[category] || [];
+      const updated = currentList.includes(traitId)
+        ? currentList.filter(t => t !== traitId)
+        : [...currentList, traitId];
+
+      const newTraits = { ...a.traits, [category]: updated };
+
+      // Constrói prompt de sistema descritivo
+      const descParts = [];
+      if (newTraits.tones?.length) descParts.push(`Tom: ${newTraits.tones.join(', ')}.`);
+      if (newTraits.stances?.length) descParts.push(`Postura: ${newTraits.stances.join(', ')}.`);
+      if (newTraits.styles?.length) descParts.push(`Estilo: ${newTraits.styles.join(', ')}.`);
+      const built = `${descParts.join(' ')} ${a.customInstruction || ''}`.trim();
+
+      return { ...a, traits: newTraits, builtInstruction: built };
+    }));
+  };
+
+  // Upload e compressão de imagem
+  const handleImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const processed = await processAndCompressImage(file);
+      setAttachedImage(processed);
+    } catch (err) {
+      alert('Erro ao comprimir imagem: ' + err.message);
+    }
+  };
+
+  // --- Gestão de Conversas (Guardar & Carregar) ---
+  const handleSaveSession = () => {
+    const title = prompt('Título para esta tertúlia:', sessionTitle) || sessionTitle;
+    setSessionTitle(title);
+
+    const updatedSession = {
+      id: currentSessionId || `sess-${Date.now()}`,
+      title,
+      date: new Date().toLocaleDateString('pt-PT'),
+      messages,
+      selectedAgentIds
+    };
+
+    setSessions(prev => {
+      const filtered = prev.filter(s => s.id !== updatedSession.id);
+      return [updatedSession, ...filtered];
+    });
+    setCurrentSessionId(updatedSession.id);
+  };
+
+  const handleLoadSession = (sess) => {
+    setCurrentSessionId(sess.id);
+    setSessionTitle(sess.title);
+    setMessages(sess.messages || []);
+    setSelectedAgentIds(sess.selectedAgentIds || agents.map(a => a.id));
+    setActiveTab('chat');
+  };
+
+  const handleNewSession = () => {
+    setCurrentSessionId(null);
+    setSessionTitle('Nova Tertúlia');
+    setMessages([]);
+    setAttachedImage(null);
+    setActiveTab('chat');
+  };
+
+  // --- Motor de Envio e Réplicas Autónomas ---
+  const handleSendMessage = async (e) => {
+    e.preventDefault();
+    const query = inputMessage.trim();
+    if (!query && !attachedImage) return;
+
+    const userMsg = {
+      id: `usr-${Date.now()}`,
+      role: 'user',
+      senderName: 'Utilizador',
+      text: query,
+      imageAttachment: attachedImage,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+
+    const currentHistory = [...messages, userMsg];
+    setMessages(currentHistory);
+    setInputMessage('');
+    const activeImage = attachedImage;
+    setAttachedImage(null);
+
+    // Identificar tertulianos presentes
+    const seatedAgents = agents.filter(a => selectedAgentIds.includes(a.id));
+    if (seatedAgents.length === 0) return;
+
+    // Disparar ciclo
+    runDialogueCycle(currentHistory, seatedAgents, activeImage);
+  };
+
+  const runDialogueCycle = async (startHistory, seatedAgents, initialImage) => {
+    setIsDialogueRunning(true);
+    stopRequestedRef.current = false;
+    let localHistory = [...startHistory];
+    let replicaCount = 0;
+
+    // Primeira resposta: o primeiro agente ou todos na primeira intervenção
+    let currentAgentIndex = 0;
+
+    while (replicaCount < maxReplicas && !stopRequestedRef.current) {
+      const currentAgent = seatedAgents[currentAgentIndex % seatedAgents.length];
+      setLoadingAgentName(currentAgent.displayName);
+      setCurrentReplicaCount(replicaCount + 1);
+
+      try {
+        const replyText = await sendAgentMessage({
+          agent: currentAgent,
+          messages: localHistory,
+          imageAttachment: replicaCount === 0 ? initialImage : null
+        });
+
+        if (stopRequestedRef.current) break;
+
+        const aiMsg = {
+          id: `ai-${Date.now()}-${currentAgent.id}`,
+          role: 'assistant',
+          senderName: currentAgent.displayName,
+          color: currentAgent.color,
+          text: replyText,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+
+        localHistory = [...localHistory, aiMsg];
+        setMessages([...localHistory]);
+        replicaCount++;
+
+        // Se turn-taking for desligado, responde apenas uma vez e para
+        if (turnTakingMode === 'none') break;
+
+        // Pausa breve entre réplicas para leitura natural
+        await new Promise(r => setTimeout(r, 1500));
+        currentAgentIndex++;
+      } catch (err) {
+        const errorMsg = {
+          id: `err-${Date.now()}`,
+          role: 'assistant',
+          senderName: currentAgent.displayName,
+          color: currentAgent.color,
+          text: `⚠️ Erro de comunicação: ${err.message}`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+        setMessages(prev => [...prev, errorMsg]);
+        break;
+      }
+    }
+
+    setLoadingAgentName(null);
+    setIsDialogueRunning(false);
+  };
+
+  const handleStopDialogue = () => {
+    stopRequestedRef.current = true;
+    setIsDialogueRunning(false);
+    setLoadingAgentName(null);
+  };
+
+  return (
+    <div className={`flex h-screen ${theme.bg} ${theme.textMain} font-sans`}>
+      {/* --- BARRA LATERAL (Histórico & Sessões) --- */}
+      <aside className={`w-20 md:w-64 border-r ${theme.border} ${theme.panelBg} flex flex-col justify-between shrink-0`}>
+        <div className="flex flex-col h-full overflow-hidden">
+          {/* Logótipo */}
+          <div className={`p-4 border-b ${theme.border} flex items-center justify-between`}>
+            <div className="flex items-center gap-2.5">
+              <Bot className="w-6 h-6 text-emerald-400 shrink-0" />
+              <span className="hidden md:block font-bold text-lg tracking-tight">
+                Tertul<span className="text-emerald-400">IA</span>
+              </span>
+            </div>
+            <button
+              onClick={handleNewSession}
+              className="hidden md:flex p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition"
+              title="Nova Tertúlia"
+            >
+              <Plus className="w-5 h-5" />
+            </button>
+          </div>
+
+          {/* Navegação Rápida */}
+          <nav className="p-2 space-y-1">
+            <button
+              onClick={() => setActiveTab('chat')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
+                activeTab === 'chat' ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              <MessageSquare className="w-4 h-4 shrink-0" />
+              <span className="hidden md:block">Mesa Atual</span>
+            </button>
+            <button
+              onClick={() => setActiveTab('agents')}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-semibold transition ${
+                activeTab === 'agents' ? 'bg-emerald-500/10 text-emerald-400' : 'text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              <Users className="w-4 h-4 shrink-0" />
+              <span className="hidden md:block">Tertulianos ({agents.length})</span>
+            </button>
+          </nav>
+
+          {/* Lista de Sessões Guardadas */}
+          <div className="hidden md:flex flex-col flex-1 overflow-y-auto px-3 py-2">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-slate-500 px-2 mb-2">
+              Conversas Anteriores
+            </span>
+            <div className="space-y-1">
+              {sessions.map(s => (
+                <button
+                  key={s.id}
+                  onClick={() => handleLoadSession(s)}
+                  className={`w-full text-left p-2 rounded-lg text-xs truncate transition flex items-center justify-between ${
+                    currentSessionId === s.id ? 'bg-slate-800 text-white font-medium' : 'text-slate-400 hover:bg-slate-800/50'
+                  }`}
+                >
+                  <span className="truncate">{s.title}</span>
+                  <span className="text-[10px] text-slate-500 shrink-0">{s.date}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Rodapé Definições */}
+        <div className={`p-3 border-t ${theme.border}`}>
+          <button
+            onClick={() => setActiveTab('settings')}
+            className="w-full flex items-center gap-3 px-2 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-slate-800 transition"
+          >
+            <Settings className="w-4 h-4 shrink-0" />
+            <span className="hidden md:block">Definições & Temas</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* --- ÁREA PRINCIPAL --- */}
+      <main className="flex-1 flex flex-col h-full overflow-hidden">
+        {activeTab === 'chat' && (
+          <div className="flex-1 flex flex-col h-full">
+            {/* Cabeçalho da Tertúlia */}
+            <div className={`px-6 py-3 border-b ${theme.border} ${theme.panelBg} flex items-center justify-between gap-4`}>
+              <div className="flex items-center gap-3">
+                <h1 className="font-bold text-sm tracking-tight">{sessionTitle}</h1>
+                <div className="hidden md:flex items-center gap-1.5 ml-2">
+                  {agents.map(a => {
+                    const isSeated = selectedAgentIds.includes(a.id);
+                    return (
+                      <button
+                        key={a.id}
+                        onClick={() => {
+                          setSelectedAgentIds(prev => 
+                            prev.includes(a.id) ? prev.filter(x => x !== a.id) : [...prev, a.id]
+                          );
+                        }}
+                        className={`px-2.5 py-1 rounded-full text-xs font-medium border flex items-center gap-1.5 transition ${
+                          isSeated ? 'opacity-100 shadow-sm' : 'opacity-40 border-slate-700 bg-slate-800'
+                        }`}
+                        style={{
+                          borderColor: a.color,
+                          backgroundColor: isSeated ? `${a.color}20` : undefined,
+                          color: isSeated ? a.color : '#94a3b8'
+                        }}
+                      >
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: a.color }} />
+                        {a.displayName}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Ações da Sessão */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleSaveSession}
+                  className="px-3 py-1.5 rounded-lg border border-slate-700 hover:bg-slate-800 text-xs font-medium text-slate-300 transition"
+                >
+                  Guardar
+                </button>
+                <button
+                  onClick={() => exportConversationToMarkdown(sessionTitle, messages, agents)}
+                  className="p-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 transition"
+                  title="Exportar Markdown"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Painel do Diálogo Estilo WhatsApp */}
+            <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4">
+              {messages.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-slate-500 space-y-2">
+                  <Bot className="w-10 h-10 opacity-30 stroke-[1.5]" />
+                  <p className="text-sm">A mesa está posta. Lança um tema para iniciar a tertúlia.</p>
+                </div>
+              ) : (
+                messages.map((m) => {
+                  const isUser = m.role === 'user';
+                  return (
+                    <div key={m.id} className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+                      {!isUser && (
+                        <div className="flex items-center gap-2 mb-1 ml-1 text-xs font-bold" style={{ color: m.color }}>
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: m.color }} />
+                          {m.senderName}
+                        </div>
+                      )}
+
+                      <div
+                        className={`max-w-[85%] md:max-w-[75%] rounded-2xl px-4 py-3 text-sm shadow-md ${
+                          isUser ? theme.userBubble + ' rounded-tr-none' : theme.aiBubbleBg + ' border rounded-tl-none'
+                        }`}
+                        style={{ borderColor: !isUser ? `${m.color}40` : undefined }}
+                      >
+                        {m.imageAttachment && (
+                          <img
+                            src={m.imageAttachment.dataUrl}
+                            alt="Anexo"
+                            className="max-h-60 rounded-lg mb-2 object-contain"
+                          />
+                        )}
+                        <div className="prose prose-invert prose-sm max-w-none leading-relaxed">
+                          <ReactMarkdown>{m.text}</ReactMarkdown>
+                        </div>
+                        <span className="block text-[10px] mt-1 text-right opacity-60">
+                          {m.timestamp}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+
+              {/* Indicador de Estado Ativo & Botão Parar */}
+              {isDialogueRunning && (
+                <div className="flex items-center justify-between p-3 rounded-xl bg-slate-900 border border-emerald-500/30">
+                  <div className="flex items-center gap-2 text-xs text-emerald-400">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>
+                      Réplica {currentReplicaCount} de {maxReplicas}: <b>{loadingAgentName}</b> está a intervir...
+                    </span>
+                  </div>
+                  <button
+                    onClick={handleStopDialogue}
+                    className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition"
+                  >
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                    Interromper Mesa
+                  </button>
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Input e Envio */}
+            <form onSubmit={handleSendMessage} className={`p-4 border-t ${theme.border} ${theme.panelBg}`}>
+              {attachedImage && (
+                <div className="flex items-center gap-2 mb-2 p-2 bg-slate-900 rounded-lg w-fit border border-slate-800">
+                  <img src={attachedImage.dataUrl} alt="Preview" className="w-10 h-10 object-cover rounded" />
+                  <span className="text-xs text-slate-400">Imagem pronta</span>
+                  <button onClick={() => setAttachedImage(null)} className="text-slate-500 hover:text-white p-1">
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 max-w-5xl mx-auto">
+                <input
+                  type="file"
+                  accept="image/*"
+                  ref={fileInputRef}
+                  onChange={handleImageUpload}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="p-3 text-slate-400 hover:text-white bg-slate-900 border border-slate-800 rounded-xl transition"
+                  title="Anexar imagem"
+                >
+                  <ImageIcon className="w-5 h-5" />
+                </button>
+
+                <input
+                  type="text"
+                  value={inputMessage}
+                  onChange={(e) => setInputMessage(e.target.value)}
+                  placeholder="Lança um tópico para debate ou intervém..."
+                  className={`flex-1 ${theme.inputBg} border ${theme.border} rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 text-slate-100 placeholder:text-slate-600`}
+                />
+
+                <button
+                  type="submit"
+                  disabled={(!inputMessage.trim() && !attachedImage) || isDialogueRunning}
+                  className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 p-3 rounded-xl transition font-semibold"
+                >
+                  <Send className="w-5 h-5" />
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {/* --- ABA DE TERTULIANOS --- */}
+        {activeTab === 'agents' && (
+          <div className="flex-1 overflow-y-auto p-6 md:p-10 max-w-4xl mx-auto w-full">
+            <div className="flex items-center justify-between pb-6 border-b border-slate-800 mb-6">
+              <div>
+                <h2 className="text-xl font-bold">Gestão de Tertulianos</h2>
+                <p className="text-xs text-slate-400 mt-1">Configura operadores, credenciais, cores e traços de personalidade.</p>
+              </div>
+              <button
+                onClick={() => {
+                  const newA = {
+                    id: `agent-${Date.now()}`,
+                    displayName: `Tertuliano ${agents.length + 1}`,
+                    operator: 'google',
+                    model: 'gemini-3.5-flash-lite',
+                    apiKey: '',
+                    color: PRESET_COLORS[agents.length % PRESET_COLORS.length],
+                    traits: { tones: ['informal'], stances: ['constructive'], styles: ['concise'] },
+                    customInstruction: '',
+                    builtInstruction: 'Responde de forma concisa.'
+                  };
+                  setAgents([...agents, newA]);
+                }}
+                className="flex items-center gap-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 px-4 py-2 rounded-lg text-sm font-semibold transition"
+              >
+                <Plus className="w-4 h-4" />
+                Convidar Tertuliano
+              </button>
+            </div>
+
+            <div className="space-y-6">
+              {agents.map(agent => (
+                <div key={agent.id} className="bg-slate-900 border rounded-xl p-5 space-y-4" style={{ borderColor: `${agent.color}40` }}>
+                  <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                    <div className="flex items-center gap-3">
+                      <div className="w-4 h-4 rounded-full" style={{ backgroundColor: agent.color }} />
+                      <input
+                        type="text"
+                        value={agent.displayName}
+                        onChange={(e) => setAgents(agents.map(a => a.id === agent.id ? { ...a, displayName: e.target.value } : a))}
+                        className="bg-transparent font-bold text-white border-b border-transparent focus:border-emerald-500 focus:outline-none"
+                      />
+                    </div>
+                    {agents.length > 1 && (
+                      <button
+                        onClick={() => setAgents(agents.filter(a => a.id !== agent.id))}
+                        className="text-slate-500 hover:text-red-400 p-1"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                    {/* Operador */}
+                    <div>
+                      <label className="block text-slate-400 font-medium mb-1">Operador</label>
+                      <select
+                        value={agent.operator}
+                        onChange={(e) => {
+                          const op = OPERATORS.find(o => o.id === e.target.value);
+                          setAgents(agents.map(a => a.id === agent.id ? {
+                            ...a,
+                            operator: op.id,
+                            model: op.models[0].id
+                          } : a));
+                        }}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-slate-200"
+                      >
+                        {OPERATORS.map(op => <option key={op.id} value={op.id}>{op.name}</option>)}
+                      </select>
+                    </div>
+
+                    {/* Modelo */}
+                    <div>
+                      <label className="block text-slate-400 font-medium mb-1">Modelo</label>
+                      <select
+                        value={agent.model}
+                        onChange={(e) => setAgents(agents.map(a => a.id === agent.id ? { ...a, model: e.target.value } : a))}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-slate-200"
+                      >
+                        {OPERATORS.find(o => o.id === agent.operator)?.models.map(m => (
+                          <option key={m.id} value={m.id}>{m.name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* API Key */}
+                    <div className="md:col-span-2">
+                      <label className="block text-slate-400 font-medium mb-1">API Key</label>
+                      <input
+                        type="password"
+                        value={agent.apiKey}
+                        onChange={(e) => setAgents(agents.map(a => a.id === agent.id ? { ...a, apiKey: e.target.value } : a))}
+                        placeholder="Chave de API deste modelo..."
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-slate-200 font-mono"
+                      />
+                    </div>
+
+                    {/* Cores */}
+                    <div className="md:col-span-2">
+                      <label className="block text-slate-400 font-medium mb-1.5">Cor Identificadora</label>
+                      <div className="flex items-center gap-2">
+                        {PRESET_COLORS.map(c => (
+                          <button
+                            key={c}
+                            onClick={() => setAgents(agents.map(a => a.id === agent.id ? { ...a, color: c } : a))}
+                            className="w-6 h-6 rounded-full transition hover:scale-110"
+                            style={{ backgroundColor: c }}
+                          />
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Matriz de Personalidade por Checkbox */}
+                    <div className="md:col-span-2 space-y-3 pt-2">
+                      <label className="block text-slate-400 font-medium">Matriz de Personalidade</label>
+                      
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
+                          <span className="text-[10px] font-bold text-slate-500 uppercase">Tom</span>
+                          {PERSONALITY_TRAITS.tones.map(t => (
+                            <label key={t.id} className="flex items-center gap-2 mt-1.5 cursor-pointer text-slate-300">
+                              <input
+                                type="checkbox"
+                                checked={agent.traits?.tones?.includes(t.id)}
+                                onChange={() => updateAgentTraits(agent.id, 'tones', t.id)}
+                              />
+                              {t.label}
+                            </label>
+                          ))}
+                        </div>
+
+                        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
+                          <span className="text-[10px] font-bold text-slate-500 uppercase">Postura</span>
+                          {PERSONALITY_TRAITS.stances.map(s => (
+                            <label key={s.id} className="flex items-center gap-2 mt-1.5 cursor-pointer text-slate-300">
+                              <input
+                                type="checkbox"
+                                checked={agent.traits?.stances?.includes(s.id)}
+                                onChange={() => updateAgentTraits(agent.id, 'stances', s.id)}
+                              />
+                              {s.label}
+                            </label>
+                          ))}
+                        </div>
+
+                        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
+                          <span className="text-[10px] font-bold text-slate-500 uppercase">Estilo</span>
+                          {PERSONALITY_TRAITS.styles.map(st => (
+                            <label key={st.id} className="flex items-center gap-2 mt-1.5 cursor-pointer text-slate-300">
+                              <input
+                                type="checkbox"
+                                checked={agent.traits?.styles?.includes(st.id)}
+                                onChange={() => updateAgentTraits(agent.id, 'styles', st.id)}
+                              />
+                              {st.label}
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* --- ABA DE DEFINIÇÕES & TEMAS --- */}
+        {activeTab === 'settings' && (
+          <div className="flex-1 overflow-y-auto p-6 md:p-10 max-w-4xl mx-auto w-full space-y-8">
+            <div>
+              <h2 className="text-xl font-bold">Definições da Aplicação</h2>
+              <p className="text-xs text-slate-400 mt-1">Gere temas visuais e o comportamento das réplicas entre agentes.</p>
+            </div>
+
+            {/* Temas */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+              <h3 className="font-semibold text-sm">Tema Visual</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {Object.values(THEMES).map(th => (
+                  <button
+                    key={th.id}
+                    onClick={() => setThemeId(th.id)}
+                    className={`p-4 rounded-xl border text-left transition ${
+                      themeId === th.id ? 'border-emerald-500 bg-slate-800' : 'border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    <span className="font-bold text-xs block mb-1">{th.name}</span>
+                    <div className="flex gap-1.5 mt-2">
+                      <div className="w-4 h-4 rounded-full bg-slate-950 border border-slate-700" />
+                      <div className="w-4 h-4 rounded-full bg-emerald-500" />
+                      <div className="w-4 h-4 rounded-full bg-slate-800" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Dinâmica de Debate */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4 text-xs">
+              <h3 className="font-semibold text-sm">Dinâmica da Mesa (Conversa Entre IAs)</h3>
+              
+              <div>
+                <label className="block text-slate-400 font-medium mb-1">Passagem de Palavra (Turn-Taking)</label>
+                <select
+                  value={turnTakingMode}
+                  onChange={(e) => setTurnTakingMode(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-slate-200"
+                >
+                  <option value="sequential">Mesa Redonda Sequencial (Alterna entre os presentes)</option>
+                  <option value="none">Apenas com Intervenção Humana (Sem conversa autónoma)</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-400 font-medium mb-1">
+                  Máximo de Réplicas Automáticas ({maxReplicas} trocas)
+                </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  value={maxReplicas}
+                  onChange={(e) => setMaxReplicas(Number(e.target.value))}
+                  className="w-full accent-emerald-500"
+                />
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
